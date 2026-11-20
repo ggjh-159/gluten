@@ -37,6 +37,7 @@ import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.ReadableConfig;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.api.transformations.OneInputTransformation;
+import org.apache.flink.table.api.TableException;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.planner.delegation.PlannerBase;
 import org.apache.flink.table.planner.plan.nodes.exec.ExecEdge;
@@ -175,6 +176,15 @@ public class StreamExecGroupAggregate extends StreamExecAggregateBase {
               + "Please provide a query configuration with valid retention interval to prevent excessive "
               + "state size. You may specify a retention time of 0 to not clean up the state.");
     }
+    if (stateRetentionTime > 0) {
+      // Flink asks for idle-state cleanup, but the native keyed state has no expiry bookkeeping
+      // yet. Fail at plan time instead of silently ignoring the setting and growing unbounded.
+      throw new TableException(
+          "Velox group aggregate does not support state TTL yet: 'table.exec.state.ttl' / "
+              + "STATE_TTL hint would be ignored and state could grow without bound. "
+              + "Please unset it (default 0 = never clean up, which matches the native behavior).");
+    }
+    // TODO: pass the retention time into the native keyed state backend once velox supports expiry.
 
     final ExecEdge inputEdge = getInputEdges().get(0);
     final Transformation<RowData> inputTransform =
@@ -195,6 +205,15 @@ public class StreamExecGroupAggregate extends StreamExecAggregateBase {
             .skip(grouping.length)
             .limit(aggCalls.length)
             .collect(Collectors.toList());
+    if (grouping.length == 0) {
+      // The velox KeyedStateSpec rejects an empty key channel list (VELOX_CHECK in its C++
+      // constructor), so a global aggregate would pass planning here and only die at task start
+      // with a JNI error. Reject it at plan time with a clear message instead.
+      throw new TableException(
+          "Velox group aggregate does not support global aggregation "
+              + "(no GROUP BY keys) yet: the native keyed state requires a key channel.");
+    }
+    // TODO: support global aggregation (dummy-key rewrite or native keyless state).
     List<Integer> keyIndexes = Arrays.stream(grouping).boxed().collect(Collectors.toList());
     PartitionFunctionSpec keySelectorSpec = new HashPartitionFunctionSpec(inputType, keyIndexes);
     KeyedStateSpec keyedStateSpec =
